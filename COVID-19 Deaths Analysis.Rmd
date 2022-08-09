@@ -1,0 +1,206 @@
+---
+title: "COVID-19 Deaths Analysis"
+author: "Zheyuan Fan"
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+---
+The purpose of this analysis is to analyze the relationship between COVID-19 death and time, in different coutries or regions.
+
+```{r eval=FALSE}
+install.packages("gamm4")
+```
+
+```{r, message=FALSE}
+library(devtools)
+library(mgcv)
+library(gamm4)
+library(tidyverse)
+```
+
+# COVID-19 data
+
+First, plot deaths from COVID-19, so we can visualize the deaths in five different regions.
+```{r}
+# Load nCOVID-19 data
+covid_data <- read_csv("covid_data.csv")
+
+# Plot over time
+covid_data %>% 
+  filter(country_region %in% c('Hubei','Italy','Iran','South Korea','USA')) %>% 
+  na.omit() %>% 
+  ggplot(aes(time, dead, color=country_region)) +
+  geom_point() +
+  theme_minimal()
+
+# Plot from initial death in region
+covid_data %>% 
+  filter(country_region %in% c('Hubei','Italy','Iran','South Korea','USA')) %>% 
+  na.omit() %>% 
+  ggplot(aes(timeInt, dead, color=country_region)) +
+  geom_point() +
+  theme_minimal()
+
+```
+
+Now fit it a GAM resGam with `dead` as the response a smooth on `timeInt` and `country_region` as covariates. 
+```{r}
+resGam= mgcv::gam(
+  dead ~ s(timeInt, pc=0) + country_region, 
+  data=covid_data, 
+  family=poisson(link='log'))
+```
+
+Now we summarize and get the conclusion of the model, then plot it.
+
+```{r}
+summary(resGam)
+coef(resGam)
+plot(resGam)
+```
+## Conclusion from above
+The estimated degrees of freedom for the smooth of `timeInt` is 8.758, we see an edf is much higher than 1(which is 8.758), which means the relationship between deaths and time is not close to linear. We can interpret the coefficients for `country_region`. For example, country_regionAustralia has a coefficient of 0.078, means time has a positive relationship with deaths due to COVID-19 in Australia, one unit of time will cause 0.078 more deaths in Australia.
+
+Next, we fit and plot two more GAMs with the same model but with `k = 50` and `k = 20`.
+```{r}
+resGam3= mgcv::gam(
+  dead ~ s(timeInt, k=50, pc=0) + country_region, data=covid_data, 
+  family=poisson(link='log'), method='ML')
+plot(resGam3)
+gam.check(resGam3)
+
+resGam4 = mgcv::gam(
+  dead ~ s(timeInt, k=20, pc=0) + country_region, data=covid_data, 
+  family=poisson(link='log'), method='ML')
+plot(resGam4)
+gam.check(resGam4)
+```
+
+```{r, cache=TRUE}
+covid_data$timeIntInd = covid_data$timeInt
+
+resGammInd = gamm4::gamm4(
+  dead ~ country_region + 
+      s(timeInt, k=20, pc=0),
+	random = ~ (1|timeIntInd), 
+	data=covid_data, family=poisson(link='log'))
+
+plot(resGammInd$gam)
+summary(resGammInd$mer)
+summary(resGammInd$gam)
+
+```
+
+The plot suggests a trend where we estimate a sharper increase in deaths per day over the first 25 days to a month and then the number decreases from about day 30 onwards. 
+
+```{r}
+covid_data_2 <- expand_grid(covid_data$timeInt, covid_data$country_region) %>% 
+  as_tibble() %>% 
+  rename(timeInt = 1, country_region = 2) %>% 
+  distinct() 
+  
+covid_data_2$predicted <- predict(resGammInd$gam, newdata=covid_data_2, type="response")
+
+#covid_data_3 <- bind_cols(covid_data_2, predicted) %>% 
+  #mutate(lower = fit - 2*se.fit, upper = fit + 2*se.fit)
+
+covid_data_2 %>% 
+  ggplot(aes(timeInt, predicted, colour=country_region)) +
+  geom_line() +
+  theme_minimal() +
+  facet_wrap(~country_region) +
+  ggtitle("Predicted deaths over time (time = 0 is first death)")
+```
+The plot shows the Predicted deaths over time (time = 0 is first death).
+
+## Fit a different model.
+Now we fit a different model with time being a random slope.
+
+```{r, cache=TRUE, eval=FALSE}
+covid_data$timeSlope = covid_data$timeInt/100
+
+resGammSlope = gamm4::gamm4(
+  dead ~ country_region + s(timeInt, k=30, pc=0),
+	random = ~(0+timeSlope|country_region) + 
+    (1|timeIntInd:country_region), 
+  data=covid_data, family=poisson(link='log'))
+#save(resGammSlope, file='resGamSlope.RData')
+plot(resGammSlope$gam)
+summary(resGammSlope$mer)
+names(lme4::ranef(resGammSlope$mer))
+theRanef = lme4::ranef(resGammSlope$mer, condVar = TRUE)$country_region
+(theRanefVec = sort(drop(t(theRanef))))
+
+Dcountry = 'France'
+toPredict = expand.grid(
+  timeInt = 0:100, 
+  country_region = Dcountry)
+toPredict$timeSlope = toPredict$timeIntInd = 
+  toPredict$timeInt
+thePred = predict(resGammSlope$gam, 
+                  newdata=toPredict, se.fit=TRUE)
+
+matplot(toPredict$timeInt, 
+        exp(do.call(cbind, thePred) %*% Pmisc::ciMat(0.75)), 
+        type='l',
+        col=c('black','grey','grey'), 
+        ylim = c(0, 25))
+points(covid_data[covid_data$country_region == Dcountry,c('timeInt','dead')], 
+       col='red')
+```
+
+
+# Appendix
+
+1. The COVID-19 data was retrieved from GitHub and the procedure is shown below.
+```{r gettingCOVIDdata, eval=FALSE}
+install.packages("devtools")
+devtools::install_github("GuangchuangYu/nCov2019")
+
+x1 <- nCov2019::load_nCov2019(lang = 'en')
+
+cutoff=3
+
+x2 = by(x1$global, x1$global[,'country', drop=FALSE], 
+		function(xx) {
+		xx$incidence = diff(c(0, xx$cum_confirm))
+		xx$dead = diff(c(0, xx$cum_dead))
+		if(any(xx$cum_dead >= cutoff)) {
+			cutoffHere = min(xx[xx$cum_dead >= cutoff,'time'], na.rm=TRUE) +1
+			xx$timeInt = as.numeric(difftime(xx$time, cutoffHere, units='days'))
+			xx = xx[xx$timeInt >= 0, ]
+			xx=					xx[,c('time','timeInt','cum_confirm','cum_dead','incidence','dead','country')]
+		} else {
+			xx = NULL
+		}
+		xx
+	}, simplify=FALSE)
+
+x3 = by(x1$province, x1$province[,'province', drop=FALSE], 
+		function(xx) {
+		xx$incidence = diff(c(0, xx$cum_confirm))
+		xx$dead = diff(c(0, xx$cum_dead))
+		colnames(xx) = gsub("province","country", colnames(xx))
+		if(any(xx$cum_dead >= cutoff)) {
+			cutoffHere = min(xx[xx$cum_dead >= cutoff,'time'], na.rm=TRUE) +1
+			xx$timeInt = as.numeric(difftime(xx$time, cutoffHere, units='days'))
+			xx = xx[xx$timeInt >= 0, ]
+			xx=					xx[,c('time','timeInt','cum_confirm','cum_dead','incidence','dead','country')]
+		} else {
+			xx = NULL
+		}
+		xx
+	}, simplify=FALSE)
+class(x2) = class(x3) = 'list'
+x2 = x2[grep('China', names(x2), invert=TRUE)]
+x = c(x2, x3)
+x$Hubei[x$Hubei$incidence > 4000,c('dead','incidence')] = NA
+
+tidy_data <- compact(x) %>% bind_rows() %>% 
+  rename(country_region = country) %>% 
+  filter(dead>0)
+write_csv(tidy_data, "covid_data.csv")
+```
+2. Some codes were modified from the assignment of the class ran by Prof. Brown and Prof. Bolton from the  University of Toronto.
